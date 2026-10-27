@@ -1,0 +1,14 @@
+{
+  "chainId": 56,
+  "tokenAddress": "REPLACE_WITH_TOKEN_CONTRACT",
+  "amountPerAddress": "0.0001",
+  "lookbackBlocks": 500,
+  "confirmations": 15,
+  "maxGasPriceGwei": "1",
+  "rpcDelayMs": 150,
+  "timezone": "Asia/Shanghai",
+  "excludeAddresses": [],
+  "countPerRun": 50,
+  "maxGasPerRunBnb": "0.002",
+  "batchSize": 5
+}
