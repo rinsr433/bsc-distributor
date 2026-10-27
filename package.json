@@ -11,5 +11,6 @@
   },
   "dependencies": {
     "ethers": "6.17.0"
-  }
+  },
+  "license": "MIT"
 }

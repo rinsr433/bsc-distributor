@@ -121,3 +121,7 @@ Run the send command again with the same token contract and distribution wallet.
 ## macOS / Linux Commands
 
 From the project folder, use `npm ci` to install dependencies, `npm run preview` to preview addresses, and `npm run send -- --execute` to send tokens.
+
+## License and Private Key Security
+
+**Keep your private keys and seed phrases secure. Do not send them to other people or third-party services, and do not include them in repositories, logs, or screenshots.** The `.env` file stores local configuration in plain text. Restrict access and store it securely. Use a dedicated distribution wallet containing only the assets and transaction fees you need.
