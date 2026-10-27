@@ -10,5 +10,8 @@
   "excludeAddresses": [],
   "countPerRun": 50,
   "maxGasPerRunBnb": "0.002",
-  "batchSize": 5
+  "batchSize": 5,
+  "collectConcurrency": 3,
+  "confirmationTimeoutMs": 120000,
+  "confirmationPollMs": 2000
 }

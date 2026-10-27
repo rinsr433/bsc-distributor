@@ -5,7 +5,7 @@ export const PUBLIC_RPC_URLS = {
 };
 
 export function rpcUrls(chainId, env = process.env) {
-  const custom = env.BSC_RPC_URLS?.trim() || env.BSC_RPC_URL?.trim();
+  const custom = env.BSC_RPC_URLS?.trim();
   const urls = custom ? custom.split(',').map(s => s.trim()).filter(Boolean) : PUBLIC_RPC_URLS[chainId];
   if (!urls?.length) throw new Error('该网络没有内置 RPC，请配置 BSC_RPC_URLS');
   for (const url of urls) {
@@ -16,9 +16,9 @@ export function rpcUrls(chainId, env = process.env) {
   return [...new Set(urls)];
 }
 
-// 在传输层切换节点，重试始终使用原始 payload（含相同的签名交易）。
+// Retry the same payload across RPC endpoints.
 export class RotatingRpcProvider extends JsonRpcProvider {
-  constructor(urls, chainId, { fetchFn = fetch, timeoutMs = 10000, log = console.log } = {}) {
+  constructor(urls, chainId, { fetchFn = fetch, timeoutMs = 10000, log = console.log, chainTtlMs = 30000, now = Date.now, wait = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
     super(urls[0], chainId, { batchMaxCount: 1, cacheTimeout: -1 });
     this.urls = urls;
     this.expectedChainId = chainId;
@@ -26,6 +26,10 @@ export class RotatingRpcProvider extends JsonRpcProvider {
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.activeIndex = 0;
+    this.chainTtlMs = chainTtlMs;
+    this.now = now;
+    this.wait = wait;
+    this.nodes = urls.map(() => ({ verifiedAt: -Infinity, probe: null, failures: 0, retryAt: 0 }));
   }
 
   async request(url, payload) {
@@ -37,29 +41,57 @@ export class RotatingRpcProvider extends JsonRpcProvider {
     const body = await response.json();
     const rows = Array.isArray(body) ? body : [body];
     const requests = Array.isArray(payload) ? payload : [payload];
-    if (rows.length !== requests.length || requests.some(p => !rows.some(r => r.id === p.id && r.jsonrpc === '2.0' && ('result' in r || 'error' in r)))) {
+    if (rows.length !== requests.length || requests.some(p => !rows.some(r => r && r.id === p.id && r.jsonrpc === '2.0' && ('result' in r || 'error' in r)))) {
       throw new Error('RPC malformed response');
     }
     return rows;
   }
 
+  async verifyChain(index, force) {
+    const node = this.nodes[index];
+    if (!force && this.now() - node.verifiedAt < this.chainTtlMs) return;
+    if (node.probe) return node.probe;
+    node.probe = (async () => {
+      const [chain] = await this.request(this.urls[index], { jsonrpc: '2.0', id: 'chain-check', method: 'eth_chainId', params: [] });
+      if (chain.error || BigInt(chain.result) !== BigInt(this.expectedChainId)) throw new Error('RPC wrong chain');
+      node.verifiedAt = this.now();
+    })();
+    try { await node.probe; } finally { node.probe = null; }
+  }
+
   async _send(payload) {
     const start = this.activeIndex;
+    const requests = Array.isArray(payload) ? payload : [payload];
+    const broadcasting = requests.some(p => p.method === 'eth_sendRawTransaction');
     for (let attempt = 0; attempt < this.urls.length; attempt++) {
       const index = (start + attempt) % this.urls.length;
+      const node = this.nodes[index];
       try {
-        // 每次请求先验证实际链 ID，不只验证列表中第一个节点。
-        const [chain] = await this.request(this.urls[index], { jsonrpc: '2.0', id: 'chain-check', method: 'eth_chainId', params: [] });
-        if (chain.error || BigInt(chain.result) !== BigInt(this.expectedChainId)) throw new Error('RPC wrong chain');
+        const delay = node.retryAt - this.now();
+        if (delay > 0) await this.wait(Math.min(delay, 2000));
+        // Refresh chain validation before every broadcast.
+        await this.verifyChain(index, broadcasting);
         const result = await this.request(this.urls[index], payload);
-        if (result.some(r => r.error && ([-32005, -32002, -32603, -32601].includes(r.error.code) || /rate limit|too many requests|temporarily unavailable|timeout/i.test(r.error.message ?? '')))) {
-          throw new Error('RPC unavailable');
+        for (const request of requests) {
+          if (request.method === 'eth_chainId') {
+            const response = result.find(r => r.id === request.id);
+            if (response.error || BigInt(response.result) !== BigInt(this.expectedChainId)) throw new Error('RPC wrong chain');
+          }
         }
-        // 合约回滚、余额不足、nonce 错误等交给上层处理，不因换节点绕过。
+        if (result.some(r => {
+          if (!r.error) return false;
+          const message = r.error.message ?? '';
+          if (/revert|insufficient funds|nonce|already known/i.test(message)) return false;
+          return [-32005, -32002, -32603, -32601].includes(r.error.code) || /rate limit|too many requests|temporarily unavailable|timeout/i.test(message);
+        })) throw new Error('RPC unavailable');
         if (index !== this.activeIndex) this.log(`RPC 已切换至备用节点 #${index + 1}`);
         this.activeIndex = index;
+        node.failures = 0; node.retryAt = 0;
         return result;
       } catch {
+        node.verifiedAt = -Infinity;
+        node.failures++;
+        node.retryAt = this.now() + Math.min(250 * 2 ** Math.min(node.failures - 1, 3), 2000);
         this.log(`RPC 节点 #${index + 1} 不可用或链不匹配，${attempt + 1 < this.urls.length ? '尝试下一个节点' : '本轮节点已用尽'}`);
       }
     }

@@ -7,7 +7,9 @@
   },
   "scripts": {
     "preview": "node --env-file-if-exists=.env src/cli.js preview",
-    "send": "node --env-file-if-exists=.env src/cli.js send"
+    "send": "node --env-file-if-exists=.env src/cli.js send",
+    "status": "node --env-file-if-exists=.env src/cli.js status",
+    "recover": "node --env-file-if-exists=.env src/cli.js recover"
   },
   "dependencies": {
     "ethers": "6.17.0"

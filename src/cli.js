@@ -2,136 +2,134 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Contract, Wallet, keccak256, parseUnits } from 'ethers';
-import { broadcastBatch, collect, dayKey, quota, settle, validateConfig } from './core.js';
+import { Contract, Wallet, parseUnits } from 'ethers';
+import { collect, quota, validateConfig } from './core.js';
 import { RotatingRpcProvider, rpcUrls } from './rpc.js';
+import { readState, saveState, unfinished } from './storage.js';
+import { StopRequested, checkStop, ensureBroadcast, inspectTransaction, settle, summarize } from './transactions.js';
+import { distribute } from './distribution.js';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dataDir = path.join(root, 'data');
-const stateFile = path.join(dataDir, 'state.json');
-const lockFile = path.join(dataDir, 'run.lock');
+const defaultRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ABI = ['function decimals() view returns (uint8)', 'function balanceOf(address) view returns (uint256)', 'function transfer(address,uint256) returns (bool)'];
 
-function atomicWrite(file, value) {
-  const temp = `${file}.tmp`;
-  const fd = fs.openSync(temp, 'w', 0o600);
-  try { fs.writeFileSync(fd, JSON.stringify(value, null, 2) + '\n'); fs.fsyncSync(fd); }
-  finally { fs.closeSync(fd); }
-  fs.renameSync(temp, file);
-  // Windows 不支持以这种方式打开目录并 fsync；文件本身已在 rename 前同步。
-  if (process.platform !== 'win32') {
-    const dir = fs.openSync(path.dirname(file), 'r');
-    try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+export async function run({ args = process.argv.slice(2), root = defaultRoot, env = process.env, log = console.log,
+  providerFactory = (config) => new RotatingRpcProvider(rpcUrls(config.chainId, env), config.chainId), signalHost = process } = {}) {
+  const [command = 'preview', ...flags] = args;
+  const writes = ['send', 'recover'].includes(command);
+  if (!['preview', 'send', 'status', 'recover'].includes(command) || flags.some(f => f !== '--execute') || (!writes && flags.length)) {
+    throw new Error('用法：preview / status / send --execute / recover --execute');
   }
-}
-
-async function main() {
-  const [command = 'preview', ...flags] = process.argv.slice(2);
-  if (!['preview', 'send'].includes(command) || flags.some(f => f !== '--execute')) throw new Error('用法：npm run preview 或 npm run send -- --execute');
-  if (command === 'send' && !flags.includes('--execute')) throw new Error('真实发送需要显式添加 --execute');
-  const config = validateConfig(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')));
-  const provider = new RotatingRpcProvider(rpcUrls(config.chainId), config.chainId);
-  let locked = false;
+  if (writes && !flags.includes('--execute')) throw new Error('真实发送或恢复需要显式添加 --execute');
+  const config = validateConfig(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')), { requireToken: command !== 'status' });
+  const dataDir = path.join(root, 'data');
+  const stateFile = path.join(dataDir, 'state.json');
+  const lockFile = path.join(dataDir, 'run.lock');
+  let locked = false; let provider; let stopping = false;
+  const runEntries = []; const stats = { skippedBeforeSend: 0 };
+  const stopped = () => stopping;
+  const requestStop = () => {
+    if (!stopping) log('收到停止请求，将停止新增广播，等待当前请求结束并保留状态。已广播交易不会撤回。');
+    stopping = true;
+  };
+  signalHost.on('SIGINT', requestStop); signalHost.on('SIGTERM', requestStop);
   try {
-    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    let lock;
-    try { lock = fs.openSync(lockFile, 'wx', 0o600); }
-    catch (e) { if (e.code === 'EEXIST') throw new Error('已有运行锁。确认旧进程已退出后再删除 data/run.lock'); throw e; }
-    locked = true;
-    fs.writeFileSync(lock, String(process.pid)); fs.closeSync(lock);
+    if (command !== 'status') {
+      fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+      let fd;
+      try { fd = fs.openSync(lockFile, 'wx', 0o600); }
+      catch (error) { if (error.code === 'EEXIST') throw new Error('已有运行锁，确认原进程已退出后再删除 data/run.lock'); throw error; }
+      locked = true;
+      try { fs.writeFileSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
+    }
+    const state = readState(stateFile);
+    const save = () => saveState(stateFile, state);
+    provider = providerFactory(config);
     if (Number((await provider.getNetwork()).chainId) !== config.chainId) throw new Error('RPC 链 ID 与配置不一致');
+    checkStop(stopped);
+    if (command === 'status') {
+      const displayed = [];
+      for (const [key, campaign] of Object.entries(state.campaigns)) {
+        if (!key.startsWith(`${config.chainId}:`)) continue;
+        for (const entry of campaign.entries.filter(unfinished)) {
+          checkStop(stopped);
+          const copy = { ...entry };
+          if (unfinished(entry)) {
+            const observation = await inspectTransaction(entry, provider, config);
+            log(`${entry.hash} 本地=${entry.status} 链上=${observation.status} 确认数=${observation.confirmations}`);
+            if (observation.status !== 'unknown') copy.status = observation.status;
+            if (['confirmed', 'reverted'].includes(observation.status) && observation.receipt.gasPrice != null) {
+              copy.actualGasWei = (observation.receipt.gasUsed * observation.receipt.gasPrice).toString();
+            }
+          }
+          displayed.push(copy);
+        }
+      }
+      log(`只读状态（仅查询未完成记录，未写文件、未广播）：${JSON.stringify(summarize(displayed))}`);
+      return;
+    }
+    const campaignKey = `${config.chainId}:${config.tokenAddress.toLowerCase()}`;
+    const campaign = state.campaigns[campaignKey] ??= { entries: [] };
+    const runId = randomUUID();
+    let wallet;
+    if (command === 'send') {
+      if (!env.PRIVATE_KEY) throw new Error('真实发送需要本机配置 PRIVATE_KEY');
+      wallet = new Wallet(env.PRIVATE_KEY, provider);
+      for (const [key, previous] of Object.entries(state.campaigns)) {
+        for (const entry of previous.entries.filter(unfinished)) {
+          if (key.startsWith(`${config.chainId}:`) && (key !== campaignKey || entry.sender.toLowerCase() !== wallet.address.toLowerCase())) {
+            throw new Error('同链其他合约或钱包存在未完成记录，请先用对应配置执行 recover');
+          }
+        }
+      }
+    }
+    if (writes) {
+      const pending = campaign.entries.filter(unfinished).sort((a, b) => a.sender.toLowerCase().localeCompare(b.sender.toLowerCase()) || a.nonce - b.nonce);
+      for (const entry of pending) {
+        checkStop(stopped);
+        const limits = quota(runEntries, config);
+        if (limits.remaining < 1 || BigInt(entry.reservedGasWei) > limits.gasRemaining) throw new Error('恢复交易将超过本次配额或预算，请调整配置；原记录已保留');
+        runEntries.push(entry);
+        log(`恢复原交易（占本次配额）：${entry.hash}`);
+        await ensureBroadcast(entry, provider, config, save, { stopped });
+        await settle(entry, provider, config, save, { stopped });
+      }
+      if (command === 'recover') { log('恢复完成，本命令不会采集地址或创建新交易。'); return; }
+    }
+    const allowance = quota(runEntries, config);
+    if (allowance.remaining === 0) { log('本次配额已用完（包含恢复的交易）。'); return; }
+    checkStop(stopped);
     if (await provider.getCode(config.tokenAddress) === '0x') throw new Error('该地址不是代币合约');
     const token = new Contract(config.tokenAddress, ABI, provider);
     const amount = parseUnits(config.amountPerAddress, Number(await token.decimals()));
     if (amount <= 0n) throw new Error('发送金额必须大于零');
-    const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { version: 1, campaigns: {} };
-    if (state.version !== 1 || !state.campaigns) throw new Error('状态文件格式异常');
-    const campaignKey = `${config.chainId}:${config.tokenAddress.toLowerCase()}`;
-    const campaign = state.campaigns[campaignKey] ??= { entries: [] };
-    const save = () => atomicWrite(stateFile, state);
-    const runId = randomUUID();
-    const runEntries = [];
-    let wallet;
-    if (command === 'send') {
-      if (!process.env.PRIVATE_KEY) throw new Error('真实发送需要本机配置 PRIVATE_KEY');
-      wallet = new Wallet(process.env.PRIVATE_KEY, provider);
-      // 任一合约有未完成交易，先恢复，避免跨合约重用 nonce。
-      for (const [key, previous] of Object.entries(state.campaigns)) {
-        for (const entry of previous.entries.filter(e => e.status === 'pending')) {
-          if (key !== campaignKey || entry.sender !== wallet.address) throw new Error('其他合约或钱包有待核对交易，请用原配置恢复');
-          const recoveryLimits = quota(runEntries, config);
-          if (recoveryLimits.remaining < 1 || BigInt(entry.reservedGasWei) > recoveryLimits.gasRemaining) {
-            throw new Error('恢复旧交易将超过本次数量或 Gas 预算，请调整配置后重试');
-          }
-          runEntries.push(entry);
-          console.log(`恢复待确认交易（占本次配额）：${entry.hash}`);
-          await settle(entry, provider, config, save);
-        }
-      }
-    }
-    const day = dayKey(config.timezone);
-    const allowance = quota(runEntries, config);
-    if (allowance.remaining === 0) { console.log('本次配额已用完（包含恢复的旧交易）。'); return; }
-    console.log(`采集地址，本次剩余配额 ${allowance.remaining}；${command === 'preview' ? '仅预览，不发送' : '真实发送模式'}`);
+    log(`采集地址，本次剩余配额 ${allowance.remaining}；${command === 'preview' ? '仅预览，不发送' : '真实发送模式'}`);
     const started = Date.now();
     let progress = '正在获取区块高度';
-    const progressTimer = setInterval(() => {
-      console.log(`${progress}；已用时 ${Math.floor((Date.now() - started) / 1000)} 秒，正在等待或查询公共节点`);
-    }, 5000);
+    const timer = setInterval(() => log(`${progress}；已用时 ${Math.floor((Date.now() - started) / 1000)} 秒`), 5000);
     let result;
     try {
-      result = await collect({ provider, token, config, entries: campaign.entries, count: allowance.remaining, sender: wallet?.address,
-        onProgress: (height, n) => { progress = `正在扫描区块 ${height}，已找到 ${n}/${allowance.remaining} 个候选地址`; } });
-    } finally {
-      clearInterval(progressTimer);
+      result = await collect({ provider, token, config, entries: [...campaign.entries.filter(unfinished), ...runEntries], count: allowance.remaining, sender: wallet?.address, stopped,
+        onProgress: (height, n) => { progress = `扫描区块 ${height}，已找到 ${n}/${allowance.remaining} 个候选地址`; } });
+    } finally { clearInterval(timer); }
+    checkStop(stopped);
+    log(`找到 ${result.selected.length} 个候选地址（仅保存在本次内存中）；采集统计：${JSON.stringify(result.stats)}`);
+    if (command === 'preview') {
+      log(`候选清单：${JSON.stringify(result.selected, null, 2)}`);
+      return;
     }
-    atomicWrite(path.join(dataDir, 'preview.json'), { day, runId, chainId: config.chainId, tokenAddress: config.tokenAddress, amountPerAddress: config.amountPerAddress, ...result });
-    console.log(`找到 ${result.selected.length} 个候选地址，清单已写入 data/preview.json`);
-    if (command === 'preview') return;
-    for (let offset = 0; offset < result.selected.length; offset += config.batchSize) {
-      const batch = [];
-      const latestNonce = await provider.getTransactionCount(wallet.address, 'latest');
-      const pendingNonce = await provider.getTransactionCount(wallet.address, 'pending');
-      if (latestNonce !== pendingNonce) throw new Error('分发钱包存在外部待处理交易，停止发送');
-      const tokenBalance = await token.balanceOf(wallet.address);
-      const bnbBalance = await provider.getBalance(wallet.address);
-      let batchGas = 0n;
-      const connected = token.connect(wallet);
-      for (const row of result.selected.slice(offset, offset + config.batchSize)) {
-        if (await provider.getCode(row.address) !== '0x' || await token.balanceOf(row.address) !== 0n) continue;
-        if (tokenBalance < amount * BigInt(batch.length + 1)) throw new Error('分发钱包代币不足以支付整批，停止发送');
-        const gasPrice = (await provider.getFeeData()).gasPrice;
-        if (gasPrice == null || gasPrice > parseUnits(config.maxGasPriceGwei, 9)) throw new Error('Gas 价格超过配置上限或不可用');
-        if (await connected.transfer.staticCall(row.address, amount) !== true) throw new Error('代币 transfer 模拟未返回 true，停止发送');
-        const gasLimit = (await connected.transfer.estimateGas(row.address, amount)) * 120n / 100n;
-        const reservedGas = gasLimit * gasPrice;
-        const limits = quota([...runEntries, ...batch], config);
-        if (limits.remaining < 1 || reservedGas > limits.gasRemaining) throw new Error('达到本次数量或 Gas 预算上限');
-        if (bnbBalance < batchGas + reservedGas) throw new Error('分发钱包 BNB 不足以支付整批，停止发送');
-        const nonce = latestNonce + batch.length;
-        const tx = { to: config.tokenAddress, data: token.interface.encodeFunctionData('transfer', [row.address, amount]), value: 0n,
-          chainId: config.chainId, nonce, type: 0, gasPrice, gasLimit };
-        const raw = await wallet.signTransaction(tx);
-        batch.push({ ...row, day: dayKey(config.timezone), runId, amount: amount.toString(), sender: wallet.address, nonce,
-          hash: keccak256(raw), raw, reservedGasWei: reservedGas.toString(), status: 'pending' });
-        batchGas += reservedGas;
-      }
-      if (!batch.length) continue;
-      // 整批签名交易先落盘，再按连续 nonce 广播；不会等每笔确认才发下一笔。
-      campaign.entries.push(...batch);
-      runEntries.push(...batch);
-      save();
-      await broadcastBatch(batch, provider, config, save);
-    }
+    await distribute({ rows: result.selected, config, provider, token, wallet, amount, runEntries, runId, campaign, save, stopped, log, stats });
   } finally {
-    provider.destroy();
-    if (locked) fs.unlinkSync(lockFile);
+    signalHost.removeListener('SIGINT', requestStop); signalHost.removeListener('SIGTERM', requestStop);
+    if (writes) log(`本次汇总：${JSON.stringify({ ...summarize(runEntries), ...stats })}；actualGasBnb 为已确认回执的实际费用，unknownFees 为本次完成记录中费用未知的笔数。`);
+    try { provider?.destroy(); }
+    finally { if (locked) fs.unlinkSync(lockFile); }
   }
 }
 
-main().catch(error => {
-  // 不输出 RPC 错误原文，其中可能包含带凭据的 URL、请求体或私钥参数。
-  const safe = !error.code && !error.argument;
-  console.error(safe ? error.message : `运行失败（${error.code ?? 'INVALID_INPUT'}）。请检查配置、RPC、余额及 data/state.json；敏感请求详情未输出。`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  run().catch(error => {
+    const safe = !error.code && !error.argument;
+    console.error(safe ? error.message : `运行失败（${error.code ?? 'INVALID_INPUT'}）。请检查配置、RPC、余额及状态文件；敏感请求详情未输出。`);
+    process.exitCode = error instanceof StopRequested ? 130 : 1;
+  });
+}

@@ -8,3 +8,7 @@ data/
 *.log
 *.tmp
 *.zip
+# Local verification only; never publish test artifacts.
+/test/
+/tests/
+/coverage/
